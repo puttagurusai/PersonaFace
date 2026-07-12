@@ -16,7 +16,7 @@ Both send data over UDP to Blender (`127.0.0.1:9001`). The face eases back to ne
 | Requirement | Notes |
 |-------------|--------|
 | **Python 3.10+** | System Python (not Blender’s built-in Python) |
-| **Blender** | Scene with ARKit-style shape keys (download form here [`face.blend`](https://dragonboots.gumroad.com/l/metahumanhead) |
+| **Blender** | Scene with ARKit-style shape keys (download form here [`face.blend`](https://dragonboots.gumroad.com/l/metahumanhead)) |
 | **Windows** | Primary path (`rhubarb.exe`). Other OS: use the matching Rhubarb binary named `rhubarb` |
 | **Microphone / speakers** | Speakers for TTS playback; webcam only for live capture |
 
