@@ -1,58 +1,36 @@
-# download_assets.ps1
-# Downloads large assets that are NOT committed to git (see .gitignore / README).
-# Run with:  .\download_assets.ps1
+# download_assets.ps1 — orchestrator pipeline models → models/
+# Run:  .\download_assets.ps1
 
 $ErrorActionPreference = "Stop"
+$Root = Split-Path -Parent $MyInvocation.MyCommand.Path
+Set-Location $Root
+New-Item -ItemType Directory -Force -Path "models" | Out-Null
 
-Write-Host "=== Downloading project assets (not in git) ===" -ForegroundColor Cyan
+Write-Host "=== TalkFace orchestrator assets → models/ ===" -ForegroundColor Cyan
 
-$files = @(
-    @{
-        Url  = "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/kokoro-v1.0.onnx"
-        Dest = "kokoro-v1.0.onnx"
-        Size = "~310 MB"
-    },
-    @{
-        Url  = "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin"
-        Dest = "voices-v1.0.bin"
-        Size = "~27 MB"
-    },
-    @{
-        Url  = "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/latest/face_landmarker.task"
-        Dest = "face_landmarker.task"
-        Size = "~4 MB"
+function Download-HF($Repo, $Dest) {
+    if ((Test-Path $Dest) -and (Get-ChildItem $Dest -Recurse -File -ErrorAction SilentlyContinue | Measure-Object).Count -gt 3) {
+        Write-Host "Already has files: $Dest" -ForegroundColor Yellow
+        return
     }
-)
-
-foreach ($file in $files) {
-    if (Test-Path $file.Dest) {
-        Write-Host "Already exists: $($file.Dest)" -ForegroundColor Yellow
-        continue
-    }
-
-    Write-Host "Downloading $($file.Dest) ($($file.Size)) ..." -ForegroundColor White
-    try {
-        # Use curl.exe (built into Windows) with -L for redirect + progress
-        & curl.exe -L --progress-bar -o $file.Dest $file.Url
-        Write-Host "Downloaded $($file.Dest)" -ForegroundColor Green
-    } catch {
-        Write-Host "Failed to download $($file.Dest)" -ForegroundColor Red
-        Write-Host "Please download manually from:" -ForegroundColor Yellow
-        Write-Host $file.Url
+    Write-Host "Downloading $Repo → $Dest ..." -ForegroundColor White
+    New-Item -ItemType Directory -Force -Path $Dest | Out-Null
+    huggingface-cli download $Repo --local-dir $Dest
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "CLI failed; try:" -ForegroundColor Red
+        Write-Host "  python -c `"from huggingface_hub import snapshot_download; snapshot_download(repo_id='$Repo', local_dir=r'$Dest', local_dir_use_symlinks=False)`""
+    } else {
+        Write-Host "OK: $Dest" -ForegroundColor Green
     }
 }
 
-Write-Host ""
-Write-Host "=== Rhubarb (manual step) ===" -ForegroundColor Cyan
-Write-Host "1. Go to: https://github.com/DanielSWolf/rhubarb-lip-sync/releases/latest"
-Write-Host "2. Download the Windows zip"
-Write-Host "3. Extract rhubarb.exe into this folder"
-Write-Host "4. Copy the 'res' folder from the zip next to rhubarb.exe (needed for phonetic mode)"
+Download-HF "parler-tts/parler-tts-mini-v1" "models\parler-tts-mini-v1"
+Download-HF "myned-ai/wav2arkit_cpu" "models\wav2arkit_cpu"
 
 Write-Host ""
-Write-Host "After assets are present:" -ForegroundColor Green
+Write-Host "Next:" -ForegroundColor Green
 Write-Host "  pip install -r requirements.txt"
+Write-Host "  pip install git+https://github.com/huggingface/parler-tts.git"
 Write-Host "  python check_setup.py"
-Write-Host "  # In Blender: run blender_receiver.py then bpy.ops.face.stream_receiver()"
+Write-Host "  # Blender: blender_receiver.py → bpy.ops.face.stream_receiver()"
 Write-Host "  python orchestrator.py"
-Write-Host ""
