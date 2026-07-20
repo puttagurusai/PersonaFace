@@ -36,10 +36,18 @@ UDP_PORT = 9001
 # Leave empty for AUTO-DETECT + AUTO-SELECT best mesh with shape keys
 TARGET_MESH_NAME = ""
 
-# Per-packet-type smoothing
-VISEME_SMOOTHING = 0.08   # fast snap for mouth (tuned for distinct shapes)
-EMOTION_SMOOTHING = 0.25  # slower for upper face
-SMOOTHING = 0.25          # legacy default (now matches emotion)
+# Per-packet-type smoothing (fraction of new sample mixed into target each packet)
+# Mouth must track audio tightly or lips look late vs speech.
+VISEME_SMOOTHING = 0.92   # nearly snap lips to packet (sync with audio)
+EMOTION_SMOOTHING = 0.28  # brows/eyes can ease
+SMOOTHING = 0.30
+
+# Glide rates toward TARGET_VALUES each timer tick (30 Hz). Higher = snappier.
+VISEME_GLIDE = 0.80       # lips follow targets immediately
+EMOTION_GLIDE = 0.28
+
+# Verbose packet logging kills real-time performance (30 prints/sec)
+VERBOSE_PACKETS = False
 
 # Only used for legacy/manual name fixing
 NAME_OVERRIDES = {}
@@ -57,14 +65,15 @@ POST_CONNECTION_SILENCE_TIMEOUT = 300.0   # 5 minutes of total silence after con
 # ---------------------------------------------------------------------------
 # UPPER vs LOWER FACE SEPARATION
 # ---------------------------------------------------------------------------
+# Upper face driven by emotion packets. Mouth smiles/frowns stay available
+# to lip-sync (wav2arkit needs stretch/smile for speech shapes).
 UPPER_FACE_KEYS = {
     "browDownLeft", "browDownRight", "browInnerUp",
     "browOuterUpLeft", "browOuterUpRight",
     "cheekSquintLeft", "cheekSquintRight",
     "eyeSquintLeft", "eyeSquintRight",
     "eyeWideLeft", "eyeWideRight",
-    "mouthSmileLeft", "mouthSmileRight",
-    "mouthFrownLeft", "mouthFrownRight",
+    # mouthSmile / mouthFrown intentionally NOT here — lip-sync owns them while speaking
 }
 
 # Everything else (jaw, full mouth shapes, etc.) is considered lower/mouth for visemes
@@ -440,23 +449,36 @@ def _handle_packet(packet):
 
     ptype = packet.get("type")
 
-    print(f"[face_receiver] Received packet type={ptype}")
+    if VERBOSE_PACKETS:
+        print(f"[face_receiver] Received packet type={ptype}")
 
     global IS_SPEAKING
 
     if ptype == "emotion":
-        # Upper face only (brows, eyes, cheeks, smile/frown corners)
+        # Upper face only (brows, eyes, cheeks)
         global _current_emotion
         _current_emotion = packet.get("emotion", _current_emotion)
-        print(f"[face_receiver] Storing EMOTION blendshapes to targets: {list(blendshapes.keys())} (emotion={_current_emotion})")
+        if VERBOSE_PACKETS:
+            print(f"[face_receiver] EMOTION keys={list(blendshapes.keys())} ({_current_emotion})")
         _apply_blendshapes(obj, blendshapes, allowed_keys=UPPER_FACE_KEYS, smoothing=EMOTION_SMOOTHING)
 
     elif ptype == "viseme":
-        # Lower face / mouth / jaw only
+        # Mouth / jaw — set targets directly so lips stay in sync with audio
+        # (no lag from heavy smoothing; mesh still uses light VISEME_GLIDE)
         IS_SPEAKING = True
         lower_only = {k: v for k, v in blendshapes.items() if k not in UPPER_FACE_KEYS}
-        print(f"[face_receiver] Storing VISEME blendshapes to targets: {list(lower_only.keys())}")
-        _apply_blendshapes(obj, lower_only, allowed_keys=None, smoothing=VISEME_SMOOTHING)
+        if not lower_only:
+            return
+        for mp_name, raw_value in lower_only.items():
+            key_name = _resolve_shape_key_name(mp_name, key_blocks)
+            if key_name is None:
+                continue
+            v = float(raw_value)
+            TARGET_VALUES[key_name] = v
+            _tracked_keys.add(key_name)
+            # Seed smoothed value close to target so first frames aren't stuck at 0
+            prev = _smoothed_values.get(key_name, v)
+            _smoothed_values[key_name] = prev * (1.0 - VISEME_SMOOTHING) + v * VISEME_SMOOTHING
 
     elif ptype == "rest_pose":
         # Full-face rest. smooth=True (end of sentence) only updates targets so the
@@ -545,23 +567,26 @@ class FACE_OT_stream_receiver(bpy.types.Operator):
         if event.type == "TIMER":
             now = time.time()
 
-            # Drain queue
-            latest = None
+            # Drain queue — process EVERY packet (do not keep only the last).
+            # Multi-agent orchestrator sends viseme + emotion + head each frame;
+            # dropping all but the last would leave only "head" and lips never move.
+            got_any = False
             while not _data_queue.empty():
-                latest = _data_queue.get_nowait()
-
-            if latest is not None:
+                try:
+                    pkt = _data_queue.get_nowait()
+                except Exception:
+                    break
                 if _last_packet_time is None:
                     print("[face_receiver] *** CONNECTED to orchestrator! ***")
-                    print("[face_receiver] Receiving emotion/viseme data now.")
+                    print("[face_receiver] Receiving emotion/viseme/head packets (all types applied).")
                 _last_packet_time = now
+                got_any = True
                 try:
-                    _handle_packet(latest)
+                    _handle_packet(pkt)
                 except Exception as e:
                     print(f"[face_receiver] Error handling packet: {e}")
 
-            # Step A: Every timer tick, glide _smoothed_values 30% closer to TARGET_VALUES
-            # for ALL tracked keys. This keeps values gliding continuously instead of stepping.
+            # Glide mesh toward targets. Mouth uses faster VISEME_GLIDE so lips open fully.
             try:
                 obj = _get_target_object()
                 if obj and obj.data.shape_keys:
@@ -569,7 +594,9 @@ class FACE_OT_stream_receiver(bpy.types.Operator):
                     for key_name in list(_tracked_keys):
                         target = TARGET_VALUES.get(key_name, 0.0)
                         current = _smoothed_values.get(key_name, 0.0)
-                        new_val = current * 0.7 + target * 0.3
+                        is_upper = key_name in UPPER_FACE_KEYS or key_name.startswith("eye") or key_name.startswith("brow")
+                        rate = EMOTION_GLIDE if is_upper else VISEME_GLIDE
+                        new_val = current * (1.0 - rate) + target * rate
                         _smoothed_values[key_name] = new_val
                         if key_name in key_blocks:
                             key_blocks[key_name].value = new_val
