@@ -1,0 +1,77 @@
+Upcoming features / future improvements
+=======================================
+
+This release is the core orchestrator pipeline only:
+  JSON → Parler TTS → wav2arkit lips + emotion face → Blender
+
+Items below are planned or prototyped elsewhere; not required to use this repo.
+
+
+1. Multi-agent face runtime
+---------------------------
+- Separate runtime controllers for lips, eyes, brows, cheeks, head
+- Clear ownership of ARKit keys so regions do not fight each other
+- Single coordinator merging outputs at ~30 fps over UDP
+
+
+2. LLM-agnostic agent framework
+-------------------------------
+- Director + region agents (lips / eyes / brows) driven by any LLM
+- OpenAI-compatible providers (OpenAI, Grok/xAI, Ollama, OpenRouter, …)
+- Optional Anthropic provider
+- Shared tools (face policy knobs, scoped file read/write)
+- Same agent code when swapping models (config-only change)
+
+
+3. Face policy layer
+--------------------
+- Session policy: mouth gain, jaw peak, blink/gaze/brow scales, emotion
+- LLM agents set policy; real-time mesh still driven by local runtime
+- Optional: auto-plan policy from a multi-line script before playback
+
+
+4. Live webcam face capture
+---------------------------
+- MediaPipe face landmarker → full-face blendshapes over UDP
+- Webcam or video file as input (no TTS required)
+- Same Blender receiver as the talking pipeline
+
+
+5. Hybrid lip-sync
+------------------
+- Combine wav2arkit continuous motion with Rhubarb phoneme closures
+- Better consonants (M/B/P, F/V) while keeping smooth mouth motion
+
+
+6. Faster / alternate TTS
+-------------------------
+- Optional faster voice path (e.g. Kokoro) for demos
+- Parler kept as higher-quality / emotion-styled option
+- User switch: quality mode vs speed mode
+
+
+7. Rig retarget / calibration
+-----------------------------
+- Per-character curves for jawOpen, mouthClose, lower lip, etc.
+- Map generic ARKit ranges onto specific Faceit rigs more accurately
+
+
+8. Sync and polish
+------------------
+- Tighter audio–lip timing controls
+- Better idle motion (blink, gaze, head) when not speaking
+- Smoother transitions between sentences and emotions
+
+
+9. Product / integration
+------------------------
+- Single entry command: script JSON → optional LLM plan → full play
+- Live LLM conversation (Claude or other) instead of JSON paste only
+- Packaging / install scripts for end users
+
+
+Notes
+-----
+- Large models stay external downloads (not in git).
+- New features should keep the Blender UDP contract:
+    type=viseme | emotion | rest_pose | head | legacy blendshapes
