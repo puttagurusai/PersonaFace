@@ -1,163 +1,121 @@
-# TalkFace — Orchestrator pipeline (JSON → speech → lips → Blender)
+# TalkFace
 
-This package is **only** the classic **`orchestrator.py`** pipeline:
+Drive a Faceit / ARKit-style character in **Blender** from spoken lines:
 
-```
-JSON sentences
-  → Parler-TTS Mini (emotion-styled voice)
-  → WAV file
-  → wav2arkit (audio → ARKit mouth blendshapes @ 30 fps)
-  → emotion_map (upper face: brows / eyes / cheeks)
-  → UDP 127.0.0.1:9001
-  → Blender (blender_receiver.py drives Faceit / ARKit shape keys)
-```
-
-**Not included here:** webcam MediaPipe, multi-agent `face_agents`, LLM agent framework (`llm_fw`).
+**JSON text → Parler speech → lip-sync + emotion → live face in Blender**
 
 ---
 
-## What’s in this repo (upload these)
+## Pipeline overview
 
-| File | Role |
-|------|------|
-| `orchestrator.py` | Main pipeline: JSON in → TTS → lips → play + UDP |
-| `parler_voice.py` | Parler-TTS Mini helper (load model, generate WAV) |
-| `wav2arkit.py` | Audio → mouth ARKit blendshapes (ONNX) |
+```
+You paste JSON sentences
+        │
+        ▼
+┌───────────────────┐
+│  Parler-TTS Mini  │  emotion-styled voice → WAV
+└─────────┬─────────┘
+          │
+          ├──────────────────────┐
+          ▼                      ▼
+┌───────────────────┐   ┌───────────────────┐
+│  wav2arkit (ONNX) │   │  emotion_map      │
+│  mouth / jaw @30fps│   │  brows / eyes     │
+└─────────┬─────────┘   └─────────┬─────────┘
+          │                       │
+          └───────────┬───────────┘
+                      ▼
+              Play audio (speakers)
+              UDP → 127.0.0.1:9001
+                      │
+                      ▼
+              blender_receiver.py
+              (inside Blender)
+                      │
+                      ▼
+              Character face moves
+```
+
+| Stage | What it does |
+|--------|----------------|
+| **Input** | Short sentences with emotion + intensity |
+| **TTS** | Parler-TTS Mini generates speech audio |
+| **Lips** | wav2arkit turns audio into ARKit mouth shapes |
+| **Emotion** | Upper face (brows, eyes, cheeks) from emotion presets |
+| **Blender** | Receiver applies shape keys in real time |
+
+---
+
+## Repository contents
+
+| File | Purpose |
+|------|---------|
+| `orchestrator.py` | Main app — paste JSON, generate speech, stream face data |
+| `parler_voice.py` | Parler-TTS helper |
+| `wav2arkit.py` | Audio → ARKit mouth blendshapes |
 | `emotion_map.py` | Emotion → upper-face blendshape presets |
-| `blender_receiver.py` | **Run inside Blender** — UDP listener |
-| `check_setup.py` | Verify packages + model folders |
-| `download_assets.ps1` | Helper to download models into `models/` |
+| `blender_receiver.py` | **Run inside Blender** — listens for UDP and drives the mesh |
+| `check_setup.py` | Checks that packages and models are installed |
+| `download_assets.ps1` | Windows helper to download model files |
 | `requirements.txt` | Python dependencies |
-| `.gitignore` | Keeps large models out of git |
-| `face.blend` | Example Blender scene (optional ~10 MB) |
-| `models/README.md` | Where to put downloaded models |
+| `.gitignore` | Ignores large models and temp files |
+| `face.blend` | Example Blender scene with a face mesh |
+| `models/README.md` | Where to place downloaded models |
+| `upcoming_features.txt` | Planned improvements |
 | `README.md` | This guide |
 
-**Do not commit** (download locally instead):
-
-| Path | Approx size | Why |
-|------|-------------|-----|
-| `models/parler-tts-mini-v1/` | **~3.5 GB** | TTS weights |
-| `models/wav2arkit_cpu/` | **~385 MB** | Lip-sync ONNX |
-| `temp/` | varies | Generated WAV/JSON |
-| `rhubarb.exe` + `res/` | optional | Only if you switch to Rhubarb |
-| `__pycache__/`, `*.blend1` | — | Cache / backups |
-
----
-
-## Pipeline detail
-
-### 1. Input (you paste JSON)
-
-```json
-{"sentences": [
-  {"text": "Hello there, how are you today?", "emotion": "happy", "intensity": 0.75},
-  {"text": "That is really sad news.", "emotion": "sad", "intensity": 0.7}
-]}
-```
-
-| Field | Meaning |
-|--------|---------|
-| `text` | Spoken line |
-| `emotion` | `neutral`, `happy`, `sad`, `angry`, `surprised`, `disgusted`, `fearful`, `sarcastic`, `thinking` |
-| `intensity` | `0.0`–`1.0` |
-
-After pasting, press **Enter on a blank line**.
-
-### 2. TTS — Parler Mini
-
-- Code: `parler_voice.py`
-- Model folder: `models/parler-tts-mini-v1/`
-- Emotion → voice style description → speech WAV in `temp/sentence_N.wav`
-
-### 3. Lip-sync — wav2arkit (default)
-
-- Code: `wav2arkit.py`
-- Model folder: `models/wav2arkit_cpu/`
-- Config: `LIPSYNC_ENGINE = "wav2arkit"` in `orchestrator.py`
-- Optional: set `"rhubarb"` and install Rhubarb (see below)
-
-### 4. Upper face — emotion_map
-
-- Brows / eyes / cheeks from emotion + intensity
-- Streamed as UDP `type: "emotion"`
-- Mouth as `type: "viseme"`
-- Soft `rest_pose` at end of each line
-
-### 5. Blender
-
-- `blender_receiver.py` listens on **UDP `127.0.0.1:9001`**
-- Mesh needs ARKit-style shape keys (Faceit, etc.)
-
-```
-JSON → Parler → WAV → wav2arkit → visemes
-                 ↘ emotion_map → upper face
-                              → sounddevice plays audio
-                              → UDP → Blender mesh
-```
+Large model weights are **not** stored in git (see setup below).
 
 ---
 
 ## Requirements
 
-- **Python 3.10+** (system Python, **not** Blender’s)
-- **Blender** with ARKit / Faceit shape keys (use `face.blend` or your own)
-- **GPU recommended** for Parler (CUDA). CPU works but is slow
-- Windows is the primary path tested here
+- **Python 3.10+** (system Python — not Blender’s built-in Python)
+- **Blender** with ARKit-style shape keys (this repo includes `face.blend`, or use your own Faceit character)
+- **Windows** is the primary tested platform
+- **GPU with CUDA recommended** for Parler (CPU works but is much slower)
 
 ---
 
-## Setup (first time)
+## Setup
 
-### Step 1 — Clone / copy this folder
+### 1. Clone the repository
 
 ```powershell
-cd path\to\this\project
+git clone <your-repo-url>
+cd <project-folder>
 ```
 
-### Step 2 — Python packages
+### 2. Install Python packages
 
 ```powershell
 pip install -r requirements.txt
-```
-
-**Parler package** (not only transformers):
-
-```powershell
 pip install git+https://github.com/huggingface/parler-tts.git
 ```
 
-**PyTorch** (match your GPU/CPU):  
+Install **PyTorch** for your system (CUDA or CPU):  
 https://pytorch.org/get-started/locally/
 
-Example (CUDA 11.8 — adjust for your machine):
+Example (CUDA 11.8 — change if your setup differs):
 
 ```powershell
 pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu118
 ```
 
-Keep **torchaudio version aligned with torch** (mismatch breaks Parler imports).
+Use matching **torch** and **torchaudio** versions.
 
-### Step 3 — Download models into `models/` (not in git)
+### 3. Download models (required — not in git)
 
-Create folders if needed:
+Create the models folder:
 
 ```powershell
 mkdir models -Force
 ```
 
-#### A) Parler-TTS Mini v1 (~3.5 GB)
+#### Parler-TTS Mini v1 (~3.5 GB)
 
-**HuggingFace model:**  
-https://huggingface.co/parler-tts/parler-tts-mini-v1
-
-**Download into:**
-
-```text
-models/parler-tts-mini-v1/
-```
-
-Commands:
+- **Page:** https://huggingface.co/parler-tts/parler-tts-mini-v1  
+- **Save to:** `models/parler-tts-mini-v1/`
 
 ```powershell
 huggingface-cli download parler-tts/parler-tts-mini-v1 --local-dir models\parler-tts-mini-v1
@@ -169,23 +127,12 @@ Or:
 python -c "from huggingface_hub import snapshot_download; print(snapshot_download(repo_id='parler-tts/parler-tts-mini-v1', local_dir=r'models/parler-tts-mini-v1', local_dir_use_symlinks=False))"
 ```
 
-You should see at least:
+You need at least `config.json` and `model.safetensors` (~3.5 GB). There must be no `*.incomplete` files.
 
-- `models/parler-tts-mini-v1/config.json`
-- `models/parler-tts-mini-v1/model.safetensors` (~3.5 GB)
+#### wav2arkit lip-sync (~385 MB)
 
-No `*.incomplete` files.
-
-#### B) wav2arkit CPU (~385 MB)
-
-**HuggingFace model:**  
-https://huggingface.co/myned-ai/wav2arkit_cpu
-
-**Download into:**
-
-```text
-models/wav2arkit_cpu/
-```
+- **Page:** https://huggingface.co/myned-ai/wav2arkit_cpu  
+- **Save to:** `models/wav2arkit_cpu/`
 
 ```powershell
 huggingface-cli download myned-ai/wav2arkit_cpu --local-dir models\wav2arkit_cpu
@@ -197,76 +144,74 @@ Or:
 python -c "from huggingface_hub import snapshot_download; print(snapshot_download(repo_id='myned-ai/wav2arkit_cpu', local_dir=r'models/wav2arkit_cpu', local_dir_use_symlinks=False))"
 ```
 
-You should see:
+You need:
 
-- `models/wav2arkit_cpu/wav2arkit_cpu.onnx`
-- `models/wav2arkit_cpu/wav2arkit_cpu.onnx.data` (~380 MB)
-- `models/wav2arkit_cpu/config.json`
+- `wav2arkit_cpu.onnx`
+- `wav2arkit_cpu.onnx.data`
+- `config.json`
 
-#### C) Optional — download script
+#### Optional helper script (Windows)
 
 ```powershell
 .\download_assets.ps1
 ```
 
-(Downloads the HF models into `models/` if CLI tools work.)
-
-### Step 4 — Check setup
+### 4. Verify installation
 
 ```powershell
 python check_setup.py
 ```
 
-### Step 5 — Blender receiver
+### 5. Start Blender
 
-1. Open `face.blend` (or your Faceit scene).
-2. Open **`blender_receiver.py`** in Text Editor → **Run Script**.
-3. In Blender Python console:
+1. Open `face.blend` (or your own character with ARKit shape keys).
+2. Open `blender_receiver.py` in the Text Editor → **Run Script**.
+3. In the Blender Python console:
 
 ```python
 bpy.ops.face.stream_receiver()
 ```
 
-Leave Blender running. Stop later with:
+Leave Blender open. To stop later:
 
 ```python
 bpy.ops.face.stream_stop()
 ```
 
-### Step 6 — Run orchestrator
+### 6. Run the orchestrator
 
 ```powershell
 python orchestrator.py
 ```
 
-1. Press Enter after the receiver is running.  
-2. Paste JSON, then a **blank line**.  
-3. Face should speak and move.
+1. Press Enter only after the Blender receiver is running.  
+2. Paste a JSON block (see below).  
+3. Press **Enter on an empty line** to submit.  
+4. The character should speak and the face should move.
 
 ---
 
-## Optional: Rhubarb instead of wav2arkit
+## Input format
 
-In `orchestrator.py`:
-
-```python
-LIPSYNC_ENGINE = "rhubarb"
+```json
+{"sentences": [
+  {"text": "Hello there, how are you today?", "emotion": "happy", "intensity": 0.75},
+  {"text": "That is really sad news.", "emotion": "sad", "intensity": 0.7}
+]}
 ```
 
-Then:
-
-1. Download: https://github.com/DanielSWolf/rhubarb-lip-sync/releases/latest  
-2. Put **`rhubarb.exe`** in the project root.  
-3. Copy **`res/`** from the zip next to `rhubarb.exe`.
-
-Default remains **`wav2arkit`** (no Rhubarb required).
+| Field | Description |
+|--------|-------------|
+| `text` | Words to speak |
+| `emotion` | One of: `neutral`, `happy`, `sad`, `angry`, `surprised`, `disgusted`, `fearful`, `sarcastic`, `thinking` |
+| `intensity` | Strength from `0.0` to `1.0` |
 
 ---
 
-## Expected folder layout after setup
+## Folder layout after setup
 
 ```
-your_project/
+project/
   orchestrator.py
   parler_voice.py
   wav2arkit.py
@@ -277,51 +222,50 @@ your_project/
   requirements.txt
   .gitignore
   README.md
+  upcoming_features.txt
   face.blend
   models/
     README.md
-    parler-tts-mini-v1/          ← download (~3.5 GB)
-      config.json
-      model.safetensors
-      tokenizer files...
-    wav2arkit_cpu/               ← download (~385 MB)
-      wav2arkit_cpu.onnx
-      wav2arkit_cpu.onnx.data
-      config.json
-  temp/                          ← created at runtime (gitignored)
+    parler-tts-mini-v1/     ← you download this
+    wav2arkit_cpu/          ← you download this
+  temp/                     ← created automatically while running
 ```
 
 ---
 
-## How to run (checklist)
+## Optional: Rhubarb lip-sync
 
-| Step | Action |
-|------|--------|
-| 1 | `pip install -r requirements.txt` + parler-tts + torch |
-| 2 | Download Parler → `models/parler-tts-mini-v1/` |
-| 3 | Download wav2arkit → `models/wav2arkit_cpu/` |
-| 4 | Blender: run `blender_receiver.py` → `bpy.ops.face.stream_receiver()` |
-| 5 | `python orchestrator.py` → paste JSON |
+Default lip-sync is **wav2arkit**. To use Rhubarb instead, set in `orchestrator.py`:
 
-**Always start the Blender receiver before the orchestrator.**
+```python
+LIPSYNC_ENGINE = "rhubarb"
+```
+
+Then:
+
+1. Download: https://github.com/DanielSWolf/rhubarb-lip-sync/releases/latest  
+2. Place `rhubarb.exe` in the project root.  
+3. Copy the `res` folder from the release next to `rhubarb.exe`.
 
 ---
 
 ## Troubleshooting
 
-| Problem | Fix |
-|---------|-----|
-| Face doesn’t move | Receiver running? Console shows `CONNECTED`? Port 9001 free? |
-| Parler fails | Model folder complete? `parler-tts` installed? torch + torchaudio match? |
-| wav2arkit fails | `models/wav2arkit_cpu/*.onnx` + `.onnx.data` present? `onnxruntime` installed? |
-| No sound | Speakers / `sounddevice` / default audio device |
-| Slow TTS | Normal for Parler Mini on laptop GPU (~several seconds per line) |
-| Shape keys ignored | Names must match ARKit (`jawOpen`, `mouthSmileLeft`, …) |
+| Problem | What to try |
+|---------|-------------|
+| Face does not move | Confirm the Blender receiver is running; check for a “CONNECTED” message; ensure nothing else is using port 9001 |
+| Parler fails to load | Confirm `models/parler-tts-mini-v1/` is complete; reinstall parler-tts; match torch and torchaudio versions |
+| Lip-sync fails | Confirm `models/wav2arkit_cpu/` has both `.onnx` and `.onnx.data`; install `onnxruntime` |
+| No audio | Check speakers and that `sounddevice` works on your default device |
+| Slow speech generation | Expected with Parler Mini on many laptops; a CUDA GPU helps a lot |
+| Shape keys ignored | Key names should match ARKit style (`jawOpen`, `mouthSmileLeft`, etc.) |
 
 ---
 
-## License notes
+## License
 
-- Your project code: choose your own license.  
-- **Parler-TTS**, **wav2arkit**, and dependencies: follow their licenses on HuggingFace / GitHub.  
-- Do not commit API keys or large model binaries.
+- Project source in this repository: use under the license you attach to the repo.  
+- **Parler-TTS**, **wav2arkit**, Rhubarb, and other third-party tools: follow their licenses on Hugging Face / GitHub.  
+- Do not commit API keys or large model weight files.
+
+For planned work beyond this release, see **`upcoming_features.txt`**.
