@@ -1,81 +1,127 @@
 """
-check_setup.py
-
-Run this before orchestrator.py to verify everything is in place.
+check_setup.py — verify orchestrator.py pipeline prerequisites.
 """
 
 import os
 import sys
 from pathlib import Path
 
+
 def check_file(path: str, min_mb: float = 0, desc: str = "") -> bool:
     p = Path(path)
     if not p.exists():
-        print(f"❌ MISSING: {path}  ({desc})")
+        print(f"MISSING: {path}  ({desc})")
         return False
     size_mb = p.stat().st_size / (1024 * 1024)
     if size_mb < min_mb:
-        print(f"⚠️  TOO SMALL: {path} ({size_mb:.1f} MB, expected > {min_mb} MB)  ({desc})")
+        print(f"TOO SMALL: {path} ({size_mb:.1f} MB, expected > {min_mb} MB)  ({desc})")
         return False
-    print(f"✅ {path} ({size_mb:.1f} MB)  {desc}")
+    print(f"OK  {path} ({size_mb:.1f} MB)  {desc}")
     return True
 
+
 def main():
-    print("=== Pipeline Setup Check ===\n")
-
+    print("=== Orchestrator pipeline setup check ===\n")
     ok = True
+    models = Path("models")
 
-    # Models (TEMP: lower threshold because we are in JSON-paste mode for now)
-    check_file("kokoro-v1.0.onnx", 200, "Main Kokoro TTS model (download if missing)")
-    ok &= check_file("voices-v1.0.bin", 20, "Voice embeddings")
+    print("--- models/ ---")
+    if not models.is_dir():
+        print("MISSING: models/ — create and download assets (see README)")
+        ok = False
+    else:
+        print("OK  models/")
 
-    # Rhubarb
-    rhubarb = "rhubarb.exe" if os.name == "nt" else "rhubarb"
-    ok &= check_file(rhubarb, 1, "Rhubarb lip-sync binary")
+    # Parler
+    parler = models / "parler-tts-mini-v1"
+    incomplete = list(parler.rglob("*.incomplete")) if parler.is_dir() else []
+    weights_ok = parler.is_dir() and (
+        (parler / "model.safetensors").is_file()
+        or any(parler.glob("model*.safetensors"))
+    )
+    if weights_ok and (parler / "config.json").is_file() and not incomplete:
+        size_mb = sum(f.stat().st_size for f in parler.rglob("*") if f.is_file()) / (1024 * 1024)
+        print(f"OK  models/parler-tts-mini-v1/ ({size_mb:.0f} MB)")
+    elif incomplete:
+        print("INCOMPLETE: models/parler-tts-mini-v1/ (*.incomplete) — re-download")
+        ok = False
+    else:
+        print("MISSING: models/parler-tts-mini-v1/")
+        print("  https://huggingface.co/parler-tts/parler-tts-mini-v1")
+        print("  → download into models/parler-tts-mini-v1/")
+        ok = False
 
-    # Python packages (basic import check)
+    # wav2arkit
+    w2a = models / "wav2arkit_cpu"
+    onnx = w2a / "wav2arkit_cpu.onnx"
+    data = w2a / "wav2arkit_cpu.onnx.data"
+    if onnx.is_file() and data.is_file():
+        print(f"OK  models/wav2arkit_cpu/ ({(onnx.stat().st_size + data.stat().st_size) / (1024*1024):.0f} MB)")
+    else:
+        print("MISSING: models/wav2arkit_cpu/ (need .onnx + .onnx.data)")
+        print("  https://huggingface.co/myned-ai/wav2arkit_cpu")
+        print("  → download into models/wav2arkit_cpu/")
+        ok = False
+
     print("\n--- Python packages ---")
     packages = {
-        "anthropic": "Claude API client",
-        "kokoro_onnx": "Kokoro TTS (ONNX)",
-        "sounddevice": "Audio playback",
+        "sounddevice": "playback",
         "soundfile": "WAV I/O",
+        "numpy": "arrays",
+        "torch": "Parler",
+        "transformers": "HF",
+        "huggingface_hub": "downloads",
+        "onnxruntime": "wav2arkit",
+        "scipy": "resample",
     }
     for mod, desc in packages.items():
         try:
             __import__(mod)
-            print(f"✅ {mod}  ({desc})")
+            print(f"OK  {mod}  ({desc})")
         except ImportError:
-            print(f"❌ {mod} not installed  ({desc})")
+            print(f"MISSING: {mod}  ({desc})")
             ok = False
 
-    # Rhubarb res/ (phonetic mode)
-    print("\n--- Rhubarb resources ---")
-    res_dir = Path("res") / "sphinx"
-    if res_dir.is_dir():
-        print(f"✅ res/sphinx/ present  (phonetic models)")
-    else:
-        print("❌ res/sphinx/ missing  (copy 'res' from the Rhubarb release next to rhubarb.exe)")
+    print("\n--- Parler package ---")
+    try:
+        from parler_tts import ParlerTTSForConditionalGeneration  # noqa: F401
+        print("OK  parler_tts package")
+    except Exception as e:
+        print(f"MISSING: parler_tts ({e})")
+        print("  pip install git+https://github.com/huggingface/parler-tts.git")
         ok = False
 
-    # API key (optional in JSON-paste mode)
-    print("\n--- Environment ---")
-    if os.getenv("ANTHROPIC_API_KEY"):
-        print("✅ ANTHROPIC_API_KEY is set")
-    else:
-        print("ℹ️  ANTHROPIC_API_KEY is NOT set (OK for JSON-paste mode)")
-        print("   For live Claude later:  $env:ANTHROPIC_API_KEY = \"sk-ant-...\"")
+    try:
+        import parler_voice  # noqa: F401
+        print(f"OK  parler_voice.py → {getattr(parler_voice, 'LOCAL_MODEL_DIR', '?')}")
+    except Exception as e:
+        print(f"FAIL parler_voice: {e}")
+        ok = False
 
-    print("\n" + "="*40)
-    if ok:
-        print("✅ Required checks passed. Ready to run:")
-        print("   1. In Blender: open blender_receiver.py → Run Script")
-        print("   2. Then: bpy.ops.face.stream_receiver()")
-        print("   3. Terminal: python orchestrator.py")
+    try:
+        import wav2arkit  # noqa: F401
+        print("OK  wav2arkit.py")
+    except Exception as e:
+        print(f"FAIL wav2arkit: {e}")
+        ok = False
+
+    # Rhubarb optional
+    print("\n--- Optional Rhubarb ---")
+    rhubarb = "rhubarb.exe" if os.name == "nt" else "rhubarb"
+    if Path(rhubarb).exists():
+        print(f"OK  {rhubarb} (only needed if LIPSYNC_ENGINE=rhubarb)")
     else:
-        print("❌ Some items are missing or incomplete.")
-        print("   See README.md (One-time asset setup) and run .\\download_assets.ps1")
+        print(f"INFO  {rhubarb} not present (OK — default is wav2arkit)")
+
+    print("\n" + "=" * 40)
+    if ok:
+        print("Ready:")
+        print("  1. Blender: blender_receiver.py → bpy.ops.face.stream_receiver()")
+        print("  2. python orchestrator.py")
+    else:
+        print("Fix missing items above, then re-run check_setup.py")
         sys.exit(1)
+
 
 if __name__ == "__main__":
     main()
