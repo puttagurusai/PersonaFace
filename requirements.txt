@@ -1,13 +1,23 @@
-# System Python (not Blender's bundled Python)
+# TalkFace — orchestrator.py pipeline only
 # Install:  pip install -r requirements.txt
 
-# --- Live MediaPipe capture ---
-mediapipe>=0.10.11
-opencv-python>=4.8.0
-
-# --- Orchestrator (TTS + playback + optional Claude) ---
-kokoro-onnx>=0.4.0
+# --- Playback / I/O ---
 sounddevice>=0.4.6
 soundfile>=0.12.1
 numpy>=1.24.0
+
+# --- Optional (orchestrator imports Anthropic; not required for JSON-paste mode) ---
 anthropic>=0.28.0
+
+# --- Parler-TTS ---
+# Also install:
+#   pip install git+https://github.com/huggingface/parler-tts.git
+#   pip install torch torchaudio   # from https://pytorch.org (match CUDA/CPU)
+transformers>=4.43.0
+accelerate>=0.33.0
+huggingface_hub>=0.23.0
+
+# --- wav2arkit lip-sync ---
+onnxruntime>=1.16.0
+scipy>=1.10.0
+
