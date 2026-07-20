@@ -5,7 +5,7 @@ Main "brain" script.
 Pipeline:
 - Accept sentences (temporarily: you paste raw JSON)
 - For each sentence:
-    1. Kokoro TTS → temp/sentence_N.wav
+    1. Parler-TTS (emotion-styled voice) → temp/sentence_N.wav
     2. Rhubarb lip-sync → temp/sentence_N.json
     3. Send emotion (upper face) over UDP as type="emotion"
     4. Play audio + send timed visemes over UDP as type="viseme"
@@ -18,8 +18,8 @@ Run:
     python orchestrator.py
 
 Requirements:
-    - kokoro-v1.0.onnx + voices-v1.0.bin in project root
-    - rhubarb.exe in project root
+    - parler-tts package + HuggingFace model cache (auto-download mini-v1)
+    - rhubarb.exe (+ res/) in project root
     - (ANTHROPIC_API_KEY optional for now)
 """
 
@@ -36,9 +36,19 @@ from pathlib import Path
 import soundfile as sf
 import sounddevice as sd
 from anthropic import Anthropic
-from kokoro_onnx import Kokoro
 
 import emotion_map
+from parler_voice import (
+    build_voice_style,
+    ensure_filler_sounds,
+    generate_speech,
+    load_parler,
+)
+import wav2arkit
+
+# Lip-sync backend: "wav2arkit" (ONNX audio→ARKit) or "rhubarb" (legacy phonemes)
+LIPSYNC_ENGINE = "wav2arkit"
+
 
 # ---------------------------------------------------------------------------
 # CONFIG
@@ -58,11 +68,6 @@ else:
 # IMPORTANT for -r phonetic:
 # Rhubarb needs the 'res' folder (containing sphinx models) from the release zip
 # placed next to rhubarb.exe. Otherwise you get "could not find resource file" error.
-
-# Kokoro voice + settings
-KOKORO_VOICE = "af_heart"
-KOKORO_SPEED = 1.0
-KOKORO_LANG = "en-us"
 
 # Claude settings
 CLAUDE_MODEL = "claude-sonnet-4-6"
@@ -473,20 +478,24 @@ def get_sentences_from_raw_json() -> list[dict] | None:
 # ---------------------------------------------------------------------------
 # TTS + LIP SYNC + PLAYBACK
 # ---------------------------------------------------------------------------
-def generate_tts(kokoro: Kokoro, text: str, sentence_idx: int) -> tuple[str, int]:
-    """Generate speech with Kokoro and save WAV. Returns (wav_path, sample_rate)."""
-    print(f"  [TTS] Generating: \"{text[:60]}{'...' if len(text) > 60 else ''}\"")
-    audio, sr = kokoro.create(
-        text=text,
-        voice=KOKORO_VOICE,
-        speed=KOKORO_SPEED,
-        lang=KOKORO_LANG
+def generate_tts(text: str, emotion: str, intensity: float, output_path: str):
+    """
+    Generate emotion-styled speech with Parler-TTS.
+    Returns (audio_array, sample_rate). WAV is written to output_path.
+    """
+    print(
+        f"  [TTS/Parler] \"{text[:60]}{'...' if len(text) > 60 else ''}\"  "
+        f"emotion={emotion} intensity={intensity:.2f}"
     )
-    
-    wav_path = TEMP_DIR / f"sentence_{sentence_idx}.wav"
-    # Write as 16-bit PCM mono for Rhubarb/PocketSphinx compatibility
-    sf.write(str(wav_path), audio, sr, subtype='PCM_16')
-    return str(wav_path), sr
+    style = build_voice_style(emotion, intensity)
+    print(f"  [TTS/Parler] style: {style[:120]}...")
+    audio, sample_rate = generate_speech(
+        text=text,
+        voice_style=style,
+        output_path=output_path,
+        play_audio=False,
+    )
+    return audio, sample_rate
 
 
 def run_rhubarb(wav_path: str, sentence_idx: int) -> list[dict]:
@@ -568,35 +577,45 @@ def _emotion_resender():
         time.sleep(0.15)
 
 
-def play_audio_and_visemes(wav_path: str, sample_rate: int, cues: list[dict], emotion: str = "neutral", intensity: float = 0.0):
+def play_audio_and_visemes(
+    wav_path: str,
+    sample_rate: int,
+    cues: list[dict] | None = None,
+    emotion: str = "neutral",
+    intensity: float = 0.0,
+    arkit_frames: list[dict] | None = None,
+    arkit_fps: float = 30.0,
+):
     """
-    Play the audio and send timed viseme packets using 30fps interpolation.
-    This function blocks until the sentence audio finishes.
-    Re-sends current emotion periodically so upper face doesn't freeze.
-    Emotion onset ramps concurrently with audio start (not before).
+    Play the audio and stream mouth shapes to Blender at ~30 fps.
+
+    Lip-sync sources (prefer arkit_frames when provided):
+      - arkit_frames: list of blendshape dicts from wav2arkit (30 fps)
+      - cues: Rhubarb mouth cues (legacy letter A–X → VISEME_MAP)
     """
     global _stop_emotion_thread, _emotion_thread, _current_viseme
 
-    if not cues:
+    use_arkit = bool(arkit_frames)
+    if not use_arkit and not cues:
         cues = [{"start": 0.0, "value": DEFAULT_VISEME}]
 
     # Load audio for playback info
     audio_data, _ = sf.read(wav_path, dtype="float32")
     duration = len(audio_data) / sample_rate
 
-    print(f"  [Playback] Starting audio ({duration:.2f}s) + streaming ~60 interpolated visemes/sec to Blender...")
-    print("  [Playback] Lips should now move smoothly in Blender if receiver is active.")
+    mode = "wav2arkit" if use_arkit else "rhubarb"
+    print(f"  [Playback] Starting audio ({duration:.2f}s) lipsync={mode} @ ~30fps → Blender")
 
-    # Prepare full dicts for each cue for fast interpolation
+    # Rhubarb path: prepare interpolated cue dicts
     prepared_cues = []
-    for c in cues:
-        val = c.get("value", DEFAULT_VISEME)
-        v = val.upper() if val else DEFAULT_VISEME
-        d = VISEME_MAP.get(v, VISEME_MAP[DEFAULT_VISEME]).copy()
-        prepared_cues.append({"start": c["start"], "dict": d, "value": v})
-
-    if not prepared_cues:
-        prepared_cues = [{"start": 0.0, "dict": VISEME_MAP[DEFAULT_VISEME].copy(), "value": DEFAULT_VISEME}]
+    if not use_arkit:
+        for c in cues or []:
+            val = c.get("value", DEFAULT_VISEME)
+            v = val.upper() if val else DEFAULT_VISEME
+            d = VISEME_MAP.get(v, VISEME_MAP[DEFAULT_VISEME]).copy()
+            prepared_cues.append({"start": c["start"], "dict": d, "value": v})
+        if not prepared_cues:
+            prepared_cues = [{"start": 0.0, "dict": VISEME_MAP[DEFAULT_VISEME].copy(), "value": DEFAULT_VISEME}]
 
     # Start audio (non-blocking)
     sd.play(audio_data, sample_rate)
@@ -606,16 +625,14 @@ def play_audio_and_visemes(wav_path: str, sample_rate: int, cues: list[dict], em
     time.sleep(0.2)
     send_udp({"type": "head", "pitch": 0.0, "yaw": 0.0, "roll": 0.0})
 
-    # Start emotion onset ramp as thread CONCURRENTLY with audio (Fix 1)
-    # Face starts at neutral, reaches full expression during first ~300ms of speaking
+    # Start emotion onset ramp as thread CONCURRENTLY with audio
     target = emotion_map.get_blendshapes(emotion, intensity)
     print(f"  [Emotion] Starting CONCURRENT onset ramp for {emotion} @ {intensity:.2f} over 300ms (while audio plays)")
     onset_thread = threading.Thread(target=lambda: ramp_emotion(target, duration_ms=300, steps=10), daemon=True)
     onset_thread.start()
 
-    # Start the emotion re-sender thread AFTER onset (keeps upper face alive with viseme mods during the rest of playback)
     def delayed_resender_start():
-        time.sleep(0.31)  # after onset
+        time.sleep(0.31)
         global _stop_emotion_thread, _emotion_thread
         _stop_emotion_thread = False
         _emotion_thread = threading.Thread(target=_emotion_resender, daemon=True)
@@ -623,14 +640,10 @@ def play_audio_and_visemes(wav_path: str, sample_rate: int, cues: list[dict], em
     threading.Thread(target=delayed_resender_start, daemon=True).start()
 
     _current_viseme = DEFAULT_VISEME
-
     playback_start = time.time()
-
-    # Send initial rest viseme
     send_viseme(DEFAULT_VISEME)
     last_mouth = VISEME_MAP[DEFAULT_VISEME].copy()
 
-    # 30fps interpolation loop (Step A)
     frame_interval = 1.0 / 30.0
     last_frame_time = playback_start
 
@@ -640,70 +653,68 @@ def play_audio_and_visemes(wav_path: str, sample_rate: int, cues: list[dict], em
         if current_t >= duration:
             break
 
-        # Find current and next cue
-        current_idx = 0
-        for i, c in enumerate(prepared_cues):
-            if c["start"] <= current_t:
-                current_idx = i
-            else:
-                break
+        if use_arkit:
+            # Nearest-frame sample from wav2arkit sequence
+            interp = wav2arkit.frame_at_time(arkit_frames, current_t, fps=arkit_fps)
+            if not interp:
+                interp = last_mouth
+            _current_viseme = "X"  # no discrete letter; skip brow viseme mods
+        else:
+            current_idx = 0
+            for i, c in enumerate(prepared_cues):
+                if c["start"] <= current_t:
+                    current_idx = i
+                else:
+                    break
 
-        next_idx = min(current_idx + 1, len(prepared_cues) - 1)
-        curr = prepared_cues[current_idx]
-        nxt = prepared_cues[next_idx]
+            next_idx = min(current_idx + 1, len(prepared_cues) - 1)
+            curr = prepared_cues[current_idx]
+            nxt = prepared_cues[next_idx]
+            cue_start = curr["start"]
+            cue_end = nxt["start"]
 
-        cue_start = curr["start"]
-        cue_end = nxt["start"]
-
-        if cue_end > cue_start:
-            cue_dur = cue_end - cue_start
-            pos = current_t - cue_start
-            local_frac = pos / cue_dur
-
-            if local_frac < 0.2:
-                # first 20% of cue: lerp from previous to current
-                if current_idx > 0:
-                    prev_dict = prepared_cues[current_idx - 1]["dict"]
-                    sub_frac = local_frac / 0.2
-                    all_keys = set(prev_dict.keys()) | set(curr["dict"].keys())
-                    interp = {k: prev_dict.get(k, 0.0) * (1 - sub_frac) + curr["dict"].get(k, 0.0) * sub_frac for k in all_keys}
+            if cue_end > cue_start:
+                cue_dur = cue_end - cue_start
+                pos = current_t - cue_start
+                local_frac = pos / cue_dur
+                if local_frac < 0.2:
+                    if current_idx > 0:
+                        prev_dict = prepared_cues[current_idx - 1]["dict"]
+                        sub_frac = local_frac / 0.2
+                        all_keys = set(prev_dict.keys()) | set(curr["dict"].keys())
+                        interp = {
+                            k: prev_dict.get(k, 0.0) * (1 - sub_frac) + curr["dict"].get(k, 0.0) * sub_frac
+                            for k in all_keys
+                        }
+                    else:
+                        interp = curr["dict"].copy()
+                elif local_frac > 0.8:
+                    sub_frac = (local_frac - 0.8) / 0.2
+                    all_keys = set(curr["dict"].keys()) | set(nxt["dict"].keys())
+                    interp = {
+                        k: curr["dict"].get(k, 0.0) * (1 - sub_frac) + nxt["dict"].get(k, 0.0) * sub_frac
+                        for k in all_keys
+                    }
                 else:
                     interp = curr["dict"].copy()
-            elif local_frac > 0.8:
-                # last 20% of cue: lerp from current to next
-                sub_frac = (local_frac - 0.8) / 0.2
-                all_keys = set(curr["dict"].keys()) | set(nxt["dict"].keys())
-                interp = {k: curr["dict"].get(k, 0.0) * (1 - sub_frac) + nxt["dict"].get(k, 0.0) * sub_frac for k in all_keys}
             else:
-                # middle 60%: hold full current shape
                 interp = curr["dict"].copy()
-        else:
-            interp = curr["dict"].copy()
+            _current_viseme = prepared_cues[current_idx].get("value", DEFAULT_VISEME)
 
-        # Send interpolated viseme packet
-        packet = {"type": "viseme", "blendshapes": interp}
-        send_udp(packet)
+        send_udp({"type": "viseme", "blendshapes": interp})
         last_mouth = interp
 
-        # Update current viseme for emotion modifier merging
-        _current_viseme = prepared_cues[current_idx].get("value", DEFAULT_VISEME)
-
-        # Sleep to maintain ~30fps
         sleep_time = frame_interval - (time.time() - last_frame_time)
         if sleep_time > 0:
             time.sleep(sleep_time)
         last_frame_time = time.time()
 
-    # Wait for audio to finish (in case timing is slightly off)
     sd.wait()
 
-    # Stop the re-sender thread
     _stop_emotion_thread = True
     if _emotion_thread and _emotion_thread.is_alive():
         _emotion_thread.join(timeout=0.5)
 
-    # Smooth settle: ease mouth from last viseme → rest, then soft full-face rest.
-    # Avoids the old hard rest_pose snap (sudden jerk at end of each audio).
     print("  [Playback] Smoothly returning mouth/face to neutral (no snap)...")
     rest_mouth = VISEME_MAP[DEFAULT_VISEME]
     settle_ms = 380
@@ -712,7 +723,6 @@ def play_audio_and_visemes(wav_path: str, sample_rate: int, cues: list[dict], em
     all_mouth_keys = set(last_mouth.keys()) | set(rest_mouth.keys())
     for step in range(1, settle_steps + 1):
         frac = step / settle_steps
-        # Ease-out: fast at first, then soft landing on rest
         ease = 1.0 - (1.0 - frac) ** 2
         interp = {
             k: last_mouth.get(k, 0.0) * (1.0 - ease) + rest_mouth.get(k, 0.0) * ease
@@ -722,19 +732,16 @@ def play_audio_and_visemes(wav_path: str, sample_rate: int, cues: list[dict], em
         time.sleep(step_dt)
 
     _current_viseme = DEFAULT_VISEME
-    # Soft rest_pose: Blender glides all keys to NEUTRAL_REST (smooth=True)
-    rest_packet = {
+    send_udp({
         "type": "rest_pose",
         "smooth": True,
         "blendshapes": emotion_map.NEUTRAL_REST.copy(),
-    }
-    send_udp(rest_packet)
+    })
     time.sleep(0.15)
-
     print("  [Playback] Done.")
 
 
-def process_sentence(kokoro: Kokoro, client: Anthropic, sentence: dict, idx: int):
+def process_sentence(client: Anthropic, sentence: dict, idx: int):
     """Full pipeline for one sentence."""
     text = sentence["text"]
     emotion = sentence["emotion"]
@@ -744,22 +751,36 @@ def process_sentence(kokoro: Kokoro, client: Anthropic, sentence: dict, idx: int
     print(f"[Sentence {idx}] {text}")
     print(f"{'='*50}")
 
-    # 1. TTS (audio prepared, onset will start concurrently with playback)
-    wav_path, sr = generate_tts(kokoro, text, idx)
+    # 1. Parler TTS (emotion-styled voice → WAV)
+    wav_path = str(TEMP_DIR / f"sentence_{idx}.wav")
+    audio_data, sr = generate_tts(text, emotion, intensity, wav_path)
+    duration = len(audio_data) / float(sr)
 
-    # Load to get duration for decay
-    audio_data, _ = sf.read(wav_path, dtype="float32")
-    duration = len(audio_data) / sr
+    # 2. Lip-sync: wav2arkit (default) or Rhubarb
+    cues = None
+    arkit_frames = None
+    arkit_fps = 30.0
+    engine = (LIPSYNC_ENGINE or "wav2arkit").lower().strip()
+    if engine == "wav2arkit":
+        print("  [LipSync] Running wav2arkit (audio → ARKit blendshapes)...")
+        arkit_frames, arkit_fps, _raw = wav2arkit.audio_file_to_frames(wav_path, mouth_only=True)
+    else:
+        print("  [LipSync] Running Rhubarb...")
+        cues = run_rhubarb(wav_path, idx)
 
-    # 3. Rhubarb
-    cues = run_rhubarb(wav_path, idx)
-
-    # 4. Play + stream visemes (mouth) + concurrent emotion onset
-    # Audio starts immediately, emotion ramps during first 300ms of speech
+    # 3. Play + stream mouth + concurrent emotion onset
     global current_emotion, current_intensity
     current_emotion = emotion
     current_intensity = intensity
-    play_audio_and_visemes(wav_path, sr, cues, emotion, intensity)
+    play_audio_and_visemes(
+        wav_path,
+        sr,
+        cues=cues,
+        emotion=emotion,
+        intensity=intensity,
+        arkit_frames=arkit_frames,
+        arkit_fps=arkit_fps,
+    )
 
     # 5. Decay — ramp upper-face emotion DOWN to neutral after audio (Step D).
     # Mouth already eased closed in play_audio_and_visemes; this softens brows/eyes/smile.
@@ -782,7 +803,7 @@ def process_sentence(kokoro: Kokoro, client: Anthropic, sentence: dict, idx: int
 # ---------------------------------------------------------------------------
 def main():
     print("=" * 60)
-    print("ORCHESTRATOR — Kokoro + Rhubarb + Blender  (TEMP: Raw JSON mode)")
+    print(f"ORCHESTRATOR — Parler-TTS + lipsync={LIPSYNC_ENGINE} + Blender  (JSON mode)")
     print("=" * 60)
     print(">>> STEP 1: In Blender, run this first:")
     print("    bpy.ops.face.stream_receiver()")
@@ -799,18 +820,33 @@ def main():
     except SystemExit:
         client = None  # Will continue without it
 
+    # Load Parler once (GPU/CPU, half precision, warmup)
     try:
-        kokoro = Kokoro("kokoro-v1.0.onnx", "voices-v1.0.bin")
-        print("[OK] Kokoro TTS loaded.")
+        load_parler()
+        print("[OK] Parler-TTS loaded.")
+        # Skip filler pre-gen at startup (each is a full Parler pass ~10s).
+        # Call ensure_filler_sounds() only when you need LLM wait cover.
+        print("[OK] Parler ready (fillers lazy — not pre-generated).")
     except Exception as e:
-        print(f"ERROR loading Kokoro: {e}")
-        print("Make sure kokoro-v1.0.onnx and voices-v1.0.bin are in the project root.")
+        print(f"ERROR loading Parler-TTS: {e}")
+        print("Install: pip install git+https://github.com/huggingface/parler-tts.git")
+        print("         pip install transformers accelerate torch")
         sys.exit(1)
 
-    # Check rhubarb binary exists
-    if not Path(RHUBARB_CMD).exists():
-        print(f"WARNING: Rhubarb binary '{RHUBARB_CMD}' not found in current folder.")
-        print("Lip sync will be skipped or may fail.")
+    # Preload lip-sync backend (+ warmup so first sentence is fast)
+    if (LIPSYNC_ENGINE or "").lower() == "wav2arkit":
+        try:
+            wav2arkit.load_session()
+            print("[OK] wav2arkit ONNX loaded + warmed (audio → ARKit).")
+        except Exception as e:
+            print(f"ERROR loading wav2arkit: {e}")
+            print("  pip install onnxruntime scipy")
+            print("  Model should be in models/wav2arkit_cpu/")
+            sys.exit(1)
+    else:
+        if not Path(RHUBARB_CMD).exists():
+            print(f"WARNING: Rhubarb binary '{RHUBARB_CMD}' not found.")
+            print("Lip sync will be skipped or may fail.")
 
     print("\nReady. Paste your JSON below (then blank line).\n")
     input("Press ENTER here ONLY after you have started the receiver in Blender (and see the shape key list)... ")
@@ -848,7 +884,7 @@ def main():
         # Process each sentence in order (same pipeline)
         for i, sent in enumerate(sentences, 1):
             sentence_counter += 1
-            process_sentence(kokoro, client, sent, sentence_counter)
+            process_sentence(client, sent, sentence_counter)
 
         # Small pause between full responses
         time.sleep(0.3)
