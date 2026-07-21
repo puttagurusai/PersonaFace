@@ -1,13 +1,29 @@
-# System Python (not Blender's bundled Python)
-# Install:  pip install -r requirements.txt
+# TalkFace Brain pipeline — system Python (not Blender's Python)
+#   pip install -r requirements.txt
 
-# --- Live MediaPipe capture ---
-mediapipe>=0.10.11
-opencv-python>=4.8.0
-
-# --- Orchestrator (TTS + playback + optional Claude) ---
-kokoro-onnx>=0.4.0
+# --- Audio I/O ---
 sounddevice>=0.4.6
 soundfile>=0.12.1
 numpy>=1.24.0
-anthropic>=0.28.0
+
+# --- Parler-TTS Mini (install torch first from pytorch.org) ---
+#   pip install git+https://github.com/huggingface/parler-tts.git
+transformers>=4.43.0
+accelerate>=0.33.0
+
+# --- Lip-sync: wav2arkit (ONNX, CPU) ---
+onnxruntime>=1.16.0
+# Optional GPU ONNX for Audio2Emotion:
+# onnxruntime-gpu>=1.16.0
+scipy>=1.10.0
+
+# --- Brain (HuBERT + face heads) ---
+# torch / torchaudio: install matching CUDA/CPU from https://pytorch.org
+torchcrepe>=0.0.22
+
+# --- Hugging Face downloads ---
+huggingface_hub>=0.23.0
+
+# --- Optional: rebuild emotion_stats from parquet ---
+pandas>=2.0.0
+pyarrow>=14.0.0

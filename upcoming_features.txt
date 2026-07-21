@@ -1,0 +1,8 @@
+Upcoming / optional improvements for the Brain pipeline
+
+- Parallel TTS → wav2arkit + Audio2Emotion (lower wait before playback)
+- Prefetch next sentence while current audio plays
+- Per-character Faceit retarget profiles (jaw gain, mouthClose)
+- Stronger 12-emotion face recipes (labels A2E does not predict)
+- Pure-Brain mouth distillation toward wav2arkit quality
+- Streaming / lower-latency TTS options
